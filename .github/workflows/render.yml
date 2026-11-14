@@ -1,0 +1,260 @@
+name: Render video (sharded)
+
+# Sharded performance render of the Remotion composition "PodcastComp"
+# (1743 frames, 0-1742 @ 30fps, 1080x1920).
+#
+# IMPORTANT — the Remotion project is NOT stored in this repository.
+# This repo contains only this workflow file (and the README). The
+# project lives in a shared Google Drive folder that acts as the
+# pipeline's file store: over time it accumulates project tarballs.
+# The folder's ID is kept in the repository secret DRIVE_FOLDER_ID.
+# At trigger time you type the tarball's FILENAME (workflow input);
+# every job then resolves that filename to a Drive file ID by reading
+# the folder's embedded view, downloads the tarball, extracts it to
+# ./proj, and works inside that folder — the same pattern as the old
+# Google Colab runs (upload tarball -> extract -> render -> download
+# result), except the runner pulls the tarball itself.
+#
+# Outputs stay as GitHub run artifacts: the runner cannot upload
+# results back into Drive (that would need Google credentials), so
+# finished videos are downloaded from the run's Artifacts section.
+#
+# The timeline is split into 4 chunks that render in parallel on 4
+# separate GitHub-hosted runners; a final "stitch" job concatenates
+# them, muxes the audio and burns in the subtitles. Triggered manually
+# only (workflow_dispatch).
+
+on:
+  workflow_dispatch:
+    inputs:
+      filename:
+        description: "Tarball filename inside the Drive folder"
+        required: true
+        default: "remotion_project.tgz"
+        type: string
+      retention_days:
+        description: "Days to keep the run's artifacts"
+        required: false
+        default: "7"
+        type: string
+
+jobs:
+  shards:
+    name: Shard ${{ matrix.start }}-${{ matrix.end }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { start: 0, end: 435 }
+          - { start: 436, end: 871 }
+          - { start: 872, end: 1307 }
+          - { start: 1308, end: 1742 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner resources
+        run: |
+          echo "date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "nproc: $(nproc)"
+          free -m
+
+      - name: Resolve + download + extract project tarball
+        env:
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          FILENAME: ${{ inputs.filename }}
+        run: |
+          if [ -z "$DRIVE_FOLDER_ID" ]; then
+            echo "::error::repository secret DRIVE_FOLDER_ID is not set — see README.md (One-time setup)."
+            exit 1
+          fi
+          echo "Resolving '$FILENAME' inside the Drive folder ..."
+          curl -sL "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER_ID}#grid" -o folder.html
+          ls -la folder.html
+          if ! FILE_ID=$(python3 - "$FILENAME" <<'PYEOF'
+          import re, sys, html as htmllib
+          want = sys.argv[1]
+          doc = open('folder.html', encoding='utf-8', errors='replace').read()
+          events = []
+          for m in re.finditer(r'/file/d/([A-Za-z0-9_-]{10,})/', doc):
+              events.append((m.start(), 'id', m.group(1)))
+          for m in re.finditer(r'flip-entry-title[^>]*>([^<]+)<', doc):
+              events.append((m.start(), 'name', htmllib.unescape(m.group(1)).strip()))
+          events.sort(key=lambda e: e[0])
+          pairs = []
+          last_id = None
+          for _, kind, val in events:
+              if kind == 'id':
+                  last_id = val
+              elif last_id:
+                  pairs.append((last_id, val))
+          for fid, name in pairs:
+              if name == want:
+                  print(fid)
+                  sys.exit(0)
+          names = [n for _, n in pairs]
+          with open('found_names.txt', 'w', encoding='utf-8') as fh:
+              fh.write(', '.join(names) if names else '(none parsed)')
+          sys.stderr.write('resolver: file "' + want + '" not found in the Drive folder; files present: ' + (', '.join(names) if names else '(no files parsed)') + '\n')
+          sys.exit(1)
+          PYEOF
+          ); then
+            echo "::error::file '$FILENAME' not found in the Drive folder. Files present: $(cat found_names.txt 2>/dev/null || echo '(none parsed)')"
+            exit 1
+          fi
+          echo "Resolved '$FILENAME' -> Drive file ID $FILE_ID"
+          curl -fL "https://drive.google.com/uc?export=download&id=${FILE_ID}" -o project.tgz
+          ls -la project.tgz
+          if ! tar tzf project.tgz >/dev/null 2>&1; then
+            echo "::error::download did not return a valid gzip tarball — check that '$FILENAME' in the Drive folder really is the project tarball; the workflow downloads it with the direct form https://drive.google.com/uc?export=download&id=FILE_ID"
+            exit 1
+          fi
+          mkdir -p proj
+          tar xzf project.tgz -C proj
+          ls -la proj
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: proj/package-lock.json
+
+      - name: Install dependencies
+        working-directory: proj
+        run: npm ci
+
+      - name: Ensure Remotion browser
+        working-directory: proj
+        run: npx remotion browser ensure
+
+      - name: Render chunk ${{ matrix.start }}-${{ matrix.end }}
+        working-directory: proj
+        run: |
+          echo "RENDER_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          npx remotion render src/index.ts PodcastComp out/chunk-${{ matrix.start }}.mp4 --frames=${{ matrix.start }}-${{ matrix.end }} --x264-preset=ultrafast --concurrency=$(nproc) --timeout=120000
+          echo "RENDER_END $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ls -la out/
+
+      - name: Upload chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.start }}
+          path: proj/out/chunk-${{ matrix.start }}.mp4
+          retention-days: ${{ inputs.retention_days }}
+
+  stitch:
+    name: Stitch + mux
+    needs: shards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner resources + ffmpeg check
+        run: |
+          echo "date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "nproc: $(nproc)"
+          free -m
+          ffmpeg -version
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          merge-multiple: true
+          path: chunks/
+
+      - name: Resolve + download + extract project tarball
+        env:
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          FILENAME: ${{ inputs.filename }}
+        run: |
+          if [ -z "$DRIVE_FOLDER_ID" ]; then
+            echo "::error::repository secret DRIVE_FOLDER_ID is not set — see README.md (One-time setup)."
+            exit 1
+          fi
+          echo "Resolving '$FILENAME' inside the Drive folder ..."
+          curl -sL "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER_ID}#grid" -o folder.html
+          ls -la folder.html
+          if ! FILE_ID=$(python3 - "$FILENAME" <<'PYEOF'
+          import re, sys, html as htmllib
+          want = sys.argv[1]
+          doc = open('folder.html', encoding='utf-8', errors='replace').read()
+          events = []
+          for m in re.finditer(r'/file/d/([A-Za-z0-9_-]{10,})/', doc):
+              events.append((m.start(), 'id', m.group(1)))
+          for m in re.finditer(r'flip-entry-title[^>]*>([^<]+)<', doc):
+              events.append((m.start(), 'name', htmllib.unescape(m.group(1)).strip()))
+          events.sort(key=lambda e: e[0])
+          pairs = []
+          last_id = None
+          for _, kind, val in events:
+              if kind == 'id':
+                  last_id = val
+              elif last_id:
+                  pairs.append((last_id, val))
+          for fid, name in pairs:
+              if name == want:
+                  print(fid)
+                  sys.exit(0)
+          names = [n for _, n in pairs]
+          with open('found_names.txt', 'w', encoding='utf-8') as fh:
+              fh.write(', '.join(names) if names else '(none parsed)')
+          sys.stderr.write('resolver: file "' + want + '" not found in the Drive folder; files present: ' + (', '.join(names) if names else '(no files parsed)') + '\n')
+          sys.exit(1)
+          PYEOF
+          ); then
+            echo "::error::file '$FILENAME' not found in the Drive folder. Files present: $(cat found_names.txt 2>/dev/null || echo '(none parsed)')"
+            exit 1
+          fi
+          echo "Resolved '$FILENAME' -> Drive file ID $FILE_ID"
+          curl -fL "https://drive.google.com/uc?export=download&id=${FILE_ID}" -o project.tgz
+          ls -la project.tgz
+          if ! tar tzf project.tgz >/dev/null 2>&1; then
+            echo "::error::download did not return a valid gzip tarball — check that '$FILENAME' in the Drive folder really is the project tarball; the workflow downloads it with the direct form https://drive.google.com/uc?export=download&id=FILE_ID"
+            exit 1
+          fi
+          mkdir -p proj
+          tar xzf project.tgz -C proj
+          ls -la proj
+
+      - name: Concatenate chunks (frame order)
+        run: |
+          ls -la chunks/
+          cat > list.txt <<'EOF'
+          file 'chunks/chunk-0.mp4'
+          file 'chunks/chunk-436.mp4'
+          file 'chunks/chunk-872.mp4'
+          file 'chunks/chunk-1308.mp4'
+          EOF
+          mkdir -p proj/out
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy proj/out/podcast_master_perf.mp4
+          ls -la proj/out/
+
+      - name: Install fonts for subtitle burn-in
+        run: |
+          mkdir -p ~/.fonts
+          cp proj/fonts/*.ttf ~/.fonts/
+          fc-cache -f
+          fc-list | grep -i "Roboto Slab" || true
+
+      - name: Mux audio + burn subtitles
+        working-directory: proj
+        run: |
+          echo "MUX_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ffmpeg -y -i out/podcast_master_perf.mp4 -i public/audio.mp3 -vf "subtitles=public/subtitle.srt:fontsdir=fonts:force_style='FontName=Roboto Slab,Bold=1,MarginV=44'" -c:v libx264 -preset ultrafast -crf 18 -c:a aac -shortest out/podcast_master_perf_audio.mp4
+          echo "MUX_END $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ls -la out/
+
+      - name: Verify final file (ffprobe)
+        working-directory: proj
+        run: |
+          ffprobe -v error -show_entries stream=codec_type,codec_name,width,height -show_entries format=duration,size -of default=noprint_wrappers=1 out/podcast_master_perf_audio.mp4
+
+      - name: Upload final videos
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: |
+            proj/out/podcast_master_perf.mp4
+            proj/out/podcast_master_perf_audio.mp4
+          retention-days: ${{ inputs.retention_days }}
