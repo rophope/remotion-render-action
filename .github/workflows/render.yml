@@ -19,10 +19,12 @@ name: Render video (sharded)
 # results back into Drive (that would need Google credentials), so
 # finished videos are downloaded from the run's Artifacts section.
 #
-# The timeline is split into 4 chunks that render in parallel on 4
-# separate GitHub-hosted runners; a final "stitch" job concatenates
-# them, muxes the audio and burns in the subtitles. Triggered manually
-# only (workflow_dispatch).
+# The timeline is split into N chunks (workflow input "shard_count",
+# default 8) that render in parallel on N separate GitHub-hosted
+# runners; a small "plan" job computes the frame ranges at trigger
+# time, and a final "stitch" job concatenates the chunks, muxes the
+# audio and burns in the subtitles. Triggered manually only
+# (workflow_dispatch).
 
 on:
   workflow_dispatch:
@@ -32,6 +34,11 @@ on:
         required: true
         default: "remotion_project.tgz"
         type: string
+      shard_count:
+        description: "Number of parallel shard jobs"
+        required: false
+        default: "8"
+        type: string
       retention_days:
         description: "Days to keep the run's artifacts"
         required: false
@@ -39,17 +46,50 @@ on:
         type: string
 
 jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Compute shard ranges
+        id: plan
+        env:
+          SHARD_COUNT: ${{ inputs.shard_count }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+          raw = os.environ.get("SHARD_COUNT", "").strip()
+          try:
+              n = int(raw)
+          except ValueError:
+              print(f"::error::shard_count must be an integer between 1 and 24 (got '{raw}')")
+              sys.exit(1)
+          if not 1 <= n <= 24:
+              print(f"::error::shard_count must be an integer between 1 and 24 (got {n})")
+              sys.exit(1)
+          TOTAL_FRAMES = 1743  # frames 0..1742
+          base, rem = divmod(TOTAL_FRAMES, n)
+          include = []
+          start = 0
+          for i in range(n):
+              size = base + (1 if i < rem else 0)
+              end = start + size - 1
+              include.append({"start": start, "end": end})
+              start = end + 1
+          matrix = json.dumps({"include": include})
+          print("shard_count=" + str(n) + " ranges: " + ", ".join(str(c["start"]) + "-" + str(c["end"]) for c in include))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + matrix + "\n")
+          PYEOF
+
   shards:
     name: Shard ${{ matrix.start }}-${{ matrix.end }}
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { start: 0, end: 435 }
-          - { start: 436, end: 871 }
-          - { start: 872, end: 1307 }
-          - { start: 1308, end: 1742 }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -144,10 +184,17 @@ jobs:
 
   stitch:
     name: Stitch + mux
-    needs: shards
+    needs: [plan, shards]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install ffmpeg (not preinstalled on this runner image)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
 
       - name: Runner resources + ffmpeg check
         run: |
@@ -218,14 +265,21 @@ jobs:
           ls -la proj
 
       - name: Concatenate chunks (frame order)
+        env:
+          EXPECTED_SHARDS: ${{ inputs.shard_count }}
         run: |
           ls -la chunks/
-          cat > list.txt <<'EOF'
-          file 'chunks/chunk-0.mp4'
-          file 'chunks/chunk-436.mp4'
-          file 'chunks/chunk-872.mp4'
-          file 'chunks/chunk-1308.mp4'
-          EOF
+          found=$(ls chunks/chunk-*.mp4 2>/dev/null | wc -l)
+          if [ "$found" -ne "$EXPECTED_SHARDS" ]; then
+            echo "::error::expected $EXPECTED_SHARDS chunk files (shard_count) but found $found in chunks/:"
+            ls chunks/
+            exit 1
+          fi
+          : > list.txt
+          for f in $(ls chunks/chunk-*.mp4 | sort -t- -k2 -n); do
+            echo "file 'chunks/$(basename "$f")'" >> list.txt
+          done
+          cat list.txt
           mkdir -p proj/out
           ffmpeg -y -f concat -safe 0 -i list.txt -c copy proj/out/podcast_master_perf.mp4
           ls -la proj/out/
